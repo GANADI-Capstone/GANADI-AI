@@ -4,6 +4,7 @@ FastAPI AI 서버 - 반려동물 안구 질환 분석
 사용법:
     uvicorn api.main:app --reload --host 0.0.0.0 --port 8000
 """
+from __future__ import annotations
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Form, Body
 from fastapi.middleware.cors import CORSMiddleware
@@ -16,6 +17,7 @@ from PIL import Image
 import io
 import logging
 import os
+import sys
 from pathlib import Path
 from anthropic import Anthropic
 from dotenv import load_dotenv
@@ -283,42 +285,61 @@ def predict(model, input_tensor: torch.Tensor, animal_type: str) -> PredictionRe
 
 
 def setup_korean_font():
-    """한글 폰트 설정 및 등록"""
+    """한글 폰트 설정 및 등록 (macOS / Windows / Linux 공통 시도)"""
     try:
-        # macOS 시스템 폰트 경로 (.ttf 파일만)
-        font_paths = [
-            "/System/Library/Fonts/Supplemental/AppleGothic.ttf",  # macOS 기본
-            "/Library/Fonts/NanumGothic.ttf",  # 나눔고딕
-            "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",  # 유니코드 지원
-        ]
-        
+        font_paths: list[str] = []
+
+        if sys.platform == "darwin":
+            font_paths.extend(
+                [
+                    "/System/Library/Fonts/Supplemental/AppleGothic.ttf",
+                    "/Library/Fonts/NanumGothic.ttf",
+                    "/System/Library/Fonts/Supplemental/Arial Unicode.ttf",
+                ]
+            )
+        elif sys.platform == "win32":
+            windir = os.environ.get("WINDIR", r"C:\Windows")
+            fonts = Path(windir) / "Fonts"
+            # ReportLab TTFont는 .ttf 위주가 안전; malgun.ttf 권장
+            font_paths.extend(
+                [
+                    str(fonts / "malgun.ttf"),
+                    str(fonts / "NanumGothic.ttf"),
+                    str(fonts / "gulim.ttc"),
+                ]
+            )
+        else:
+            # Linux 등
+            font_paths.extend(
+                [
+                    "/usr/share/fonts/truetype/nanum/NanumGothic.ttf",
+                    "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+                    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+                ]
+            )
+
         for font_path in font_paths:
             if os.path.exists(font_path):
                 try:
-                    pdfmetrics.registerFont(TTFont('Korean', font_path))
+                    pdfmetrics.registerFont(TTFont("Korean", font_path))
                     logger.info(f"✓ 한글 폰트 등록 성공: {font_path}")
-                    return 'Korean'
+                    return "Korean"
                 except Exception as e:
                     logger.warning(f"폰트 등록 실패 ({font_path}): {e}")
                     continue
-        
-        # 폰트를 찾지 못한 경우
+
         logger.error("=" * 60)
         logger.error("❌ 한글 폰트를 찾지 못했습니다!")
         logger.error("=" * 60)
-        logger.error("PDF 생성 시 한글이 깨집니다. 다음 중 하나를 설치하세요:")
-        logger.error("")
-        logger.error("1. 나눔고딕 설치 (권장):")
-        logger.error("   curl -LO https://github.com/naver/nanumfont/releases/download/VER2.6/NanumFont_TTF_ALL.zip")
-        logger.error("   unzip NanumFont_TTF_ALL.zip")
-        logger.error("   sudo cp NanumFont_TTF_ALL/*.ttf /Library/Fonts/")
-        logger.error("")
-        logger.error("2. 또는 시스템 폰트 확인:")
-        logger.error("   ls /System/Library/Fonts/Supplemental/AppleGothic.ttf")
+        logger.error("PDF 한글이 깨질 수 있습니다. OS별로 아래를 참고하세요.")
+        logger.error("· macOS: 나눔고딕을 /Library/Fonts/ 에 설치")
+        logger.error("· Windows: 맑은 고딕(malgun.ttf)이 보통 %WINDIR%\\Fonts 에 있습니다.")
+        logger.error("· Linux: fonts-nanum 또는 Noto CJK 패키지 설치")
+        logger.error("나눔고딕: https://github.com/naver/nanumfont/releases")
         logger.error("=" * 60)
-        
+
         return None
-    
+
     except Exception as e:
         logger.error(f"폰트 설정 중 오류 발생: {e}")
         return None
@@ -343,8 +364,9 @@ def generate_pdf(request: PDFRequest) -> str:
     if korean_font_name is None:
         raise ValueError(
             "한글 폰트가 설정되지 않았습니다. "
-            "나눔고딕 폰트를 /Library/Fonts/에 설치하고 서버를 재시작하세요. "
-            "다운로드: https://github.com/naver/nanumfont/releases/download/VER2.6/NanumFont_TTF_ALL.zip"
+            "macOS는 /Library/Fonts/에 나눔고딕, Windows는 맑은 고딕 또는 NanumGothic.ttf를 "
+            "설치한 뒤 서버를 재시작하세요. "
+            "https://github.com/naver/nanumfont/releases"
         )
     
     font_name = korean_font_name

@@ -1,17 +1,17 @@
 import torch
-from models.classifier.model import create_model
-from models.classifier.dataset import create_dataloader
+from model import create_model
+from dataset import create_dataloader
 from collections import defaultdict
 
 device = 'mps'
 model = create_model('dog', pretrained=False)
-ckpt = torch.load('models/classifier/checkpoints/dog_best.pth', map_location=device)
+ckpt = torch.load('checkpoints/dog_best.pth', map_location=device)
 model.load_state_dict(ckpt['model_state_dict'])
 model = model.to(device)
 model.eval()
 
 val_loader = create_dataloader(
-    data_paths=['eye_data/VL/개/안구/일반'],
+    data_paths=['../../eye_data/VL/개/안구/일반'],
     animal_type='dog',
     batch_size=32,
     img_size=224,

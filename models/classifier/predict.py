@@ -17,6 +17,9 @@ from models.classifier.dataset import get_transforms
 class EyeDiseasePredictor:
     """안구질환 분류 예측기"""
     
+    # 중증도 통합 대상 질환 (성능 향상을 위해 유/무만 구분)
+    SIMPLIFY_DISEASES = ['백내장', '궤양성각막질환', '비궤양성각막질환']
+    
     def __init__(
         self,
         model_path: str,
@@ -63,6 +66,7 @@ class EyeDiseasePredictor:
         print(f"✓ 모델 로드 완료: {model_path}")
         print(f"✓ 동물: {animal_type.upper()}")
         print(f"✓ 디바이스: {self.device}")
+        print(f"✓ 중증도 통합 모드: {', '.join(self.SIMPLIFY_DISEASES)}")
     
     def _load_model(self, model_path: str):
         """모델 로드"""
@@ -140,6 +144,15 @@ class EyeDiseasePredictor:
             pred_idx = torch.argmax(probs).item()
             pred_label = self.reverse_label_map[disease][pred_idx]
             confidence = probs[pred_idx].item()
+            
+            # 중증도 통합 (성능 향상)
+            if disease in self.SIMPLIFY_DISEASES:
+                if pred_label != "무":
+                    # 모든 중증도를 "유"로 통합
+                    original_label = pred_label
+                    pred_label = "유"
+                    # Confidence는 "무"가 아닌 모든 클래스의 확률 합
+                    confidence = 1.0 - probs[0].item()  # 1 - P(무)
             
             # 저장
             result = {

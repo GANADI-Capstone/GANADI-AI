@@ -195,8 +195,8 @@ class EyeDiseaseDataset(Dataset):
                             continue
         
         # 질환별+클래스별 최대 샘플 수 제한
-        # 고양이는 데이터가 적어서 제한을 낮춤
-        MAX_PER_DISEASE_CLASS = 1000 if self.animal_type == "cat" else 3000
+        # 고양이도 소수 클래스(결막염 유 등) 학습량 확보를 위해 상한 완화
+        MAX_PER_DISEASE_CLASS = 2500 if self.animal_type == "cat" else 3000
         from collections import defaultdict
         disease_class_counts = defaultdict(int)
         filtered = []
@@ -273,96 +273,138 @@ class EyeDiseaseDataset(Dataset):
         
         return weights
     
-    def get_sample_weights(self) -> List[float]:
+    def get_sample_weights(
+        self,
+        boost_disease: Optional[str] = None,
+        boost_minority_factor: float = 2.0,
+    ) -> List[float]:
         """
         WeightedRandomSampler를 위한 샘플별 가중치 계산
         
         각 질환별로 클래스 불균형을 고려하여 샘플 가중치 계산.
         적은 클래스일수록 높은 가중치를 부여.
+
+        boost_disease: 해당 질환에서 소수 클래스(minority) 샘플 가중치를 추가 배율로 곱함
+          (예: 고양이 결막염 유/무 불균형 완화).
         
         Returns:
             샘플별 가중치 리스트 (len = 데이터셋 크기)
         """
-        from collections import defaultdict
-        
         # 1. 질환별 클래스 카운트 수집
-        disease_class_counts = {}
-        
+        disease_class_counts: Dict[str, Dict[int, int]] = {}
+
         for disease in self.diseases:
-            # 각 질환의 클래스별 샘플 수 계산
-            class_counts = defaultdict(int)
-            
+            class_counts: Dict[int, int] = defaultdict(int)
+
             for _, label_dict in self.samples:
                 label = label_dict[disease]
-                if label >= 0:  # 유효한 라벨만
+                if label >= 0:
                     class_counts[label] += 1
-            
+
             disease_class_counts[disease] = dict(class_counts)
-        
-        # 2. 각 샘플의 가중치 계산
-        sample_weights = []
-        
+
+        # boost 질환의 소수 클래스 라벨값
+        minority_label: Optional[int] = None
+        if boost_disease and boost_disease in self.diseases:
+            counts = disease_class_counts.get(boost_disease, {})
+            if len(counts) >= 2:
+                minority_label = min(counts.keys(), key=lambda k: counts[k])
+
+        sample_weights: List[float] = []
+
         for _, label_dict in self.samples:
-            # 각 질환별 가중치를 계산하고 평균
             weights_per_disease = []
-            
+
             for disease in self.diseases:
                 label = label_dict[disease]
-                
-                if label >= 0:  # 유효한 라벨이 있는 경우
-                    # 해당 클래스의 샘플 수
+
+                if label >= 0:
                     count = disease_class_counts[disease].get(label, 1)
-                    
-                    # 가중치 = 1 / count (적은 클래스 = 높은 가중치)
                     weight = 1.0 / count
                     weights_per_disease.append(weight)
-            
-            # 모든 질환의 가중치 평균
+
             if weights_per_disease:
                 avg_weight = sum(weights_per_disease) / len(weights_per_disease)
             else:
                 avg_weight = 1.0
-            
+
+            if (
+                minority_label is not None
+                and boost_disease is not None
+                and label_dict.get(boost_disease, -1) == minority_label
+            ):
+                avg_weight *= boost_minority_factor
+
             sample_weights.append(avg_weight)
-        
+
         return sample_weights
 
 
-def get_transforms(img_size: int = 300, is_training: bool = True):
+def get_transforms(
+    img_size: int = 300,
+    is_training: bool = True,
+    aug_preset: str = "default",
+):
     """
     이미지 변환 파이프라인
     
     Args:
         img_size: 이미지 크기
         is_training: 학습 모드 여부
+        aug_preset: \"default\" | \"cat_phone\"
+            cat_phone — 결막염·스마트폰 도메인 대비 색·조명·압축·블러 강화
     
     Returns:
         Albumentations Compose
     """
-    if is_training:
+    norm = A.Normalize(
+        mean=[0.485, 0.456, 0.406],
+        std=[0.229, 0.224, 0.225],
+    )
+
+    if not is_training:
         return A.Compose([
             A.Resize(img_size, img_size),
-            A.HorizontalFlip(p=0.5),
-            A.Rotate(limit=15, p=0.3),
-            A.RandomBrightnessContrast(p=0.3),
-            A.HueSaturationValue(p=0.3),
-            A.GaussNoise(p=0.2),
-            A.Blur(blur_limit=3, p=0.2),
-            A.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]
-            ),
-            ToTensorV2()
+            norm,
+            ToTensorV2(),
         ])
-    else:
-        return A.Compose([
-            A.Resize(img_size, img_size),
-            A.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225]
+
+    base_geo = [
+        A.Resize(img_size, img_size),
+        A.HorizontalFlip(p=0.5),
+        A.Rotate(limit=15, p=0.35),
+    ]
+
+    if aug_preset == "cat_phone":
+        color_phone = [
+            A.RandomBrightnessContrast(
+                brightness_limit=0.3,
+                contrast_limit=0.3,
+                p=0.55,
             ),
-            ToTensorV2()
-        ])
+            A.HueSaturationValue(
+                hue_shift_limit=20,
+                sat_shift_limit=30,
+                val_shift_limit=20,
+                p=0.55,
+            ),
+            A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=0.35),
+            A.GaussNoise(var_limit=(15.0, 60.0), p=0.25),
+            A.GaussianBlur(blur_limit=(3, 5), p=0.2),
+            A.MotionBlur(blur_limit=7, p=0.28),
+            A.ImageCompression(quality_lower=55, quality_upper=100, p=0.35),
+            A.Downscale(scale_min=0.65, scale_max=0.92, interpolation=1, p=0.22),
+        ]
+        return A.Compose(base_geo + color_phone + [norm, ToTensorV2()])
+
+    # default (기존과 동등 수준)
+    default_color = [
+        A.RandomBrightnessContrast(p=0.3),
+        A.HueSaturationValue(p=0.3),
+        A.GaussNoise(p=0.2),
+        A.Blur(blur_limit=3, p=0.2),
+    ]
+    return A.Compose(base_geo + default_color + [norm, ToTensorV2()])
 
 
 def create_dataloader(
@@ -372,7 +414,11 @@ def create_dataloader(
     img_size: int = 300,
     is_training: bool = True,
     num_workers: int = 4,
-    use_sampler: bool = False
+    use_sampler: bool = False,
+    aug_preset: str = "default",
+    sampler_boost_disease: Optional[str] = None,
+    sampler_boost_factor: float = 2.0,
+    pin_memory: Optional[bool] = None,
 ) -> DataLoader:
     """
     DataLoader 생성
@@ -385,48 +431,56 @@ def create_dataloader(
         is_training: 학습 모드 여부
         num_workers: 데이터 로더 워커 수
         use_sampler: WeightedRandomSampler 사용 여부 (클래스 불균형 처리)
+        aug_preset: get_transforms 에 전달 ("default" | "cat_phone")
+        sampler_boost_disease: 샘플러 사용 시 소수 클래스 추가 부스트 질환명 (예: 결막염)
+        sampler_boost_factor: 소수 클래스 샘플 가중 배율
+        pin_memory: None 이면 False (MPS 경고 방지). CUDA 학습 시 True 권장.
     
     Returns:
         DataLoader
     """
-    # Transform
-    transform = get_transforms(img_size, is_training)
-    
-    # Dataset
+    transform = get_transforms(img_size, is_training, aug_preset=aug_preset)
+
     dataset = EyeDiseaseDataset(
         data_paths=data_paths,
         animal_type=animal_type,
         transform=transform,
-        is_training=is_training
+        is_training=is_training,
     )
-    
-    # Sampler 설정
+
     sampler = None
     shuffle = is_training
-    
+
     if is_training and use_sampler:
-        # WeightedRandomSampler 생성
-        sample_weights = dataset.get_sample_weights()
+        sample_weights = dataset.get_sample_weights(
+            boost_disease=sampler_boost_disease,
+            boost_minority_factor=sampler_boost_factor,
+        )
         sampler = WeightedRandomSampler(
             weights=sample_weights,
             num_samples=len(sample_weights),
-            replacement=True
+            replacement=True,
         )
-        shuffle = False  # sampler 사용 시 shuffle=False
-        
+        shuffle = False
+
         print(f"✓ WeightedRandomSampler 적용 (샘플 수: {len(sample_weights)})")
-    
-    # DataLoader
+        if sampler_boost_disease:
+            print(
+                f"  · 소수 클래스 부스트: 질환={sampler_boost_disease}, 배율={sampler_boost_factor}"
+            )
+
+    use_pin = pin_memory if pin_memory is not None else False
+
     dataloader = DataLoader(
         dataset,
         batch_size=batch_size,
         shuffle=shuffle,
         sampler=sampler,
         num_workers=num_workers,
-        pin_memory=True,
-        drop_last=is_training
+        pin_memory=use_pin,
+        drop_last=is_training,
     )
-    
+
     return dataloader
 
 
