@@ -246,13 +246,13 @@ class EyeDiseaseDataset(Dataset):
     
     def get_class_weights(self, disease: str) -> torch.Tensor:
         """
-        특정 질환의 클래스별 가중치 계산 (불균형 데이터 처리용)
+        특정 질환의 클래스별 가중치 (빈도 역수 → Focal Loss alpha / CE weight).
         
         Args:
             disease: 질환명
         
         Returns:
-            클래스 가중치 텐서
+            클래스 가중치 텐서 [num_classes]
         """
         # 질환별 라벨 수집
         labels = []
@@ -340,6 +340,43 @@ class EyeDiseaseDataset(Dataset):
         return sample_weights
 
 
+def _gauss_noise_transform(p: float = 0.35):
+    """Albumentations 버전별 GaussNoise 호환 (Colab 2.x / 로컬 1.x)."""
+    import inspect
+
+    params = inspect.signature(A.GaussNoise.__init__).parameters
+    if "std_range" in params:
+        return A.GaussNoise(std_range=(0.02, 0.08), p=p)
+    return A.GaussNoise(var_limit=(15.0, 60.0), p=p)
+
+
+def _training_augmentations() -> List[A.BasicTransform]:
+    """강아지·고양이 공통 학습 증강 (Colab·스마트폰 촬영 환경 대응)."""
+    return [
+        A.HueSaturationValue(
+            hue_shift_limit=20,
+            sat_shift_limit=30,
+            val_shift_limit=20,
+            p=0.5,
+        ),
+        A.RandomBrightnessContrast(
+            brightness_limit=0.3,
+            contrast_limit=0.3,
+            p=0.5,
+        ),
+        A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=0.3),
+        A.MotionBlur(blur_limit=7, p=0.3),
+        A.ImageCompression(quality_lower=50, quality_upper=95, p=0.3),
+        A.Downscale(scale_min=0.5, scale_max=0.9, interpolation=1, p=0.3),
+        _gauss_noise_transform(p=0.2),
+    ]
+
+
+def _strong_phone_augmentations() -> List[A.BasicTransform]:
+    """하위 호환 alias — _training_augmentations 와 동일."""
+    return _training_augmentations()
+
+
 def get_transforms(
     img_size: int = 300,
     is_training: bool = True,
@@ -349,10 +386,11 @@ def get_transforms(
     이미지 변환 파이프라인
     
     Args:
-        img_size: 이미지 크기
+        img_size: 이미지 크기 (EfficientNet-B3 권장 300)
         is_training: 학습 모드 여부
-        aug_preset: \"default\" | \"cat_phone\"
-            cat_phone — 결막염·스마트폰 도메인 대비 색·조명·압축·블러 강화
+        aug_preset: \"default\" | \"strong\" | \"cat_phone\"
+            strong/cat_phone — HueSaturation, BrightnessContrast, CLAHE,
+            MotionBlur, ImageCompression, GaussNoise (Colab·고양이 권장)
     
     Returns:
         Albumentations Compose
@@ -369,42 +407,20 @@ def get_transforms(
             ToTensorV2(),
         ])
 
+    # 학습: 강아지·고양이 동일 증강 (aug_preset 은 하위 호환용, 동일 파이프라인)
     base_geo = [
         A.Resize(img_size, img_size),
         A.HorizontalFlip(p=0.5),
         A.Rotate(limit=15, p=0.35),
+        A.ShiftScaleRotate(
+            shift_limit=0.05,
+            scale_limit=0.1,
+            rotate_limit=10,
+            border_mode=0,
+            p=0.25,
+        ),
     ]
-
-    if aug_preset == "cat_phone":
-        color_phone = [
-            A.RandomBrightnessContrast(
-                brightness_limit=0.3,
-                contrast_limit=0.3,
-                p=0.55,
-            ),
-            A.HueSaturationValue(
-                hue_shift_limit=20,
-                sat_shift_limit=30,
-                val_shift_limit=20,
-                p=0.55,
-            ),
-            A.CLAHE(clip_limit=2.0, tile_grid_size=(8, 8), p=0.35),
-            A.GaussNoise(var_limit=(15.0, 60.0), p=0.25),
-            A.GaussianBlur(blur_limit=(3, 5), p=0.2),
-            A.MotionBlur(blur_limit=7, p=0.28),
-            A.ImageCompression(quality_lower=55, quality_upper=100, p=0.35),
-            A.Downscale(scale_min=0.65, scale_max=0.92, interpolation=1, p=0.22),
-        ]
-        return A.Compose(base_geo + color_phone + [norm, ToTensorV2()])
-
-    # default (기존과 동등 수준)
-    default_color = [
-        A.RandomBrightnessContrast(p=0.3),
-        A.HueSaturationValue(p=0.3),
-        A.GaussNoise(p=0.2),
-        A.Blur(blur_limit=3, p=0.2),
-    ]
-    return A.Compose(base_geo + default_color + [norm, ToTensorV2()])
+    return A.Compose(base_geo + _training_augmentations() + [norm, ToTensorV2()])
 
 
 def create_dataloader(
@@ -431,8 +447,8 @@ def create_dataloader(
         is_training: 학습 모드 여부
         num_workers: 데이터 로더 워커 수
         use_sampler: WeightedRandomSampler 사용 여부 (클래스 불균형 처리)
-        aug_preset: get_transforms 에 전달 ("default" | "cat_phone")
-        sampler_boost_disease: 샘플러 사용 시 소수 클래스 추가 부스트 질환명 (예: 결막염)
+        aug_preset: get_transforms 에 전달 ("default" | "strong" | "cat_phone")
+        sampler_boost_disease: WeightedRandomSampler — 결막염 등 소수 클래스 부스트 질환
         sampler_boost_factor: 소수 클래스 샘플 가중 배율
         pin_memory: None 이면 False (MPS 경고 방지). CUDA 학습 시 True 권장.
     

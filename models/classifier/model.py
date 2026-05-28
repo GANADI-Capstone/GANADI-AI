@@ -67,15 +67,23 @@ class MultiTaskEyeDiseaseModel(nn.Module):
     공유 백본 + 질환별 독립 분류 헤드
     """
     
-    def __init__(self, animal_type: str = "dog", pretrained: bool = True):
+    def __init__(
+        self,
+        animal_type: str = "dog",
+        pretrained: bool = True,
+        head_dropout: float = 0.4,
+    ):
         """
         Args:
             animal_type: "dog" 또는 "cat"
             pretrained: ImageNet pretrained weights 사용 여부
+            head_dropout: classifier 헤드 Dropout (0.3~0.5, 과적합 방지)
         """
         super().__init__()
         
         self.animal_type = animal_type.lower()
+        head_dropout = float(max(0.3, min(0.5, head_dropout)))
+        head_dropout2 = float(max(0.3, min(0.5, head_dropout + 0.1)))
         
         if self.animal_type == "dog":
             self.disease_heads = DOG_DISEASE_HEADS
@@ -97,20 +105,21 @@ class MultiTaskEyeDiseaseModel(nn.Module):
         # 백본 출력 차원 (EfficientNet-B3: 1536)
         self.feature_dim = self.backbone.num_features
         
-        # 질환별 분류 헤드 생성
+        # 질환별 분류 헤드 (Dropout으로 과적합 완화)
         self.classifiers = nn.ModuleDict({
             disease: nn.Sequential(
-                nn.Dropout(0.3),
+                nn.Dropout(head_dropout),
                 nn.Linear(self.feature_dim, 512),
                 nn.ReLU(),
-                nn.Dropout(0.3),
-                nn.Linear(512, num_classes)
+                nn.Dropout(head_dropout2),
+                nn.Linear(512, num_classes),
             )
             for disease, num_classes in self.disease_heads.items()
         })
         
         print(f"✓ {animal_type.upper()} 모델 생성 완료")
         print(f"  - 백본: EfficientNet-B3 (feature_dim={self.feature_dim})")
+        print(f"  - 헤드 Dropout: {head_dropout} / {head_dropout2}")
         print(f"  - 질환 수: {len(self.disease_heads)}")
         print(f"  - 총 헤드: {sum(self.disease_heads.values())} classes")
     
@@ -159,18 +168,27 @@ class MultiTaskEyeDiseaseModel(nn.Module):
         print("✓ 백본 unfreeze 완료 (전체 학습)")
 
 
-def create_model(animal_type: str = "dog", pretrained: bool = True) -> MultiTaskEyeDiseaseModel:
+def create_model(
+    animal_type: str = "dog",
+    pretrained: bool = True,
+    head_dropout: float = 0.4,
+) -> MultiTaskEyeDiseaseModel:
     """
     모델 생성 헬퍼 함수
     
     Args:
         animal_type: "dog" 또는 "cat"
         pretrained: ImageNet pretrained weights 사용 여부
+        head_dropout: classifier Dropout 비율 (0.3~0.5)
     
     Returns:
         MultiTaskEyeDiseaseModel 인스턴스
     """
-    return MultiTaskEyeDiseaseModel(animal_type=animal_type, pretrained=pretrained)
+    return MultiTaskEyeDiseaseModel(
+        animal_type=animal_type,
+        pretrained=pretrained,
+        head_dropout=head_dropout,
+    )
 
 
 def count_parameters(model: nn.Module) -> int:

@@ -10,20 +10,23 @@ import torch.nn.functional as F
 
 
 class FocalLoss(nn.Module):
-    """멀티클래스 Focal Loss.
+    """멀티클래스 Focal Loss + Label Smoothing.
 
-    FL = alpha_y * (1 - p_t)^gamma * CE(logits, y)
-    - alpha: shape [num_classes] (역빈도 등 클래스 가중) 또는 None.
+    FL = alpha_y * (1 - p_t)^gamma * CE_smooth(logits, y)
+    - alpha: 클래스 빈도 역수 [num_classes]
+    - label_smoothing: CrossEntropy label smoothing (기본 0.1)
     """
 
     def __init__(
         self,
         gamma: float = 2.0,
         alpha: Optional[torch.Tensor] = None,
+        label_smoothing: float = 0.1,
         reduction: str = "mean",
     ):
         super().__init__()
         self.gamma = gamma
+        self.label_smoothing = label_smoothing
         self.reduction = reduction
         if alpha is not None:
             self.register_buffer("alpha", alpha.float())
@@ -31,7 +34,12 @@ class FocalLoss(nn.Module):
             self.alpha = None
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        ce = F.cross_entropy(logits, targets, reduction="none")
+        ce = F.cross_entropy(
+            logits,
+            targets,
+            reduction="none",
+            label_smoothing=self.label_smoothing,
+        )
         pt = torch.exp(-ce).clamp(min=1e-8, max=1.0)
         focal = (1.0 - pt) ** self.gamma * ce
         if self.alpha is not None:
@@ -52,6 +60,7 @@ def build_per_disease_losses(
     device: str,
     use_class_weights: bool,
     focal_gamma: float,
+    label_smoothing: float = 0.1,
 ) -> nn.ModuleDict:
     """질환별 손실 모듈 생성.
 
@@ -67,14 +76,24 @@ def build_per_disease_losses(
             class_w = cw / cw.mean().clamp(min=1e-6)
 
         if loss_type == "ce":
-            modules[disease] = nn.CrossEntropyLoss(weight=class_w)
+            modules[disease] = nn.CrossEntropyLoss(
+                weight=class_w,
+                label_smoothing=label_smoothing,
+            )
         elif loss_type == "weighted_ce":
             w_eff = class_w if class_w is not None else torch.ones(
                 num_classes, device=device, dtype=torch.float32
             )
-            modules[disease] = nn.CrossEntropyLoss(weight=w_eff)
+            modules[disease] = nn.CrossEntropyLoss(
+                weight=w_eff,
+                label_smoothing=label_smoothing,
+            )
         elif loss_type == "focal":
-            modules[disease] = FocalLoss(gamma=focal_gamma, alpha=class_w)
+            modules[disease] = FocalLoss(
+                gamma=focal_gamma,
+                alpha=class_w,
+                label_smoothing=label_smoothing,
+            )
         else:
             raise ValueError(f"Unknown loss_type: {loss_type}")
 
