@@ -45,6 +45,9 @@ load_dotenv()
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+# EfficientNet-B3 학습·추론 해상도 (train.py / predict.py 와 동일)
+IMG_SIZE = 300
+
 # FastAPI 앱 생성
 app = FastAPI(
     title="반려동물 안구 질환 분석 API",
@@ -181,7 +184,7 @@ def load_model(animal_type: str):
         raise HTTPException(status_code=500, detail=f"모델 로드 실패: {str(e)}")
 
 
-def preprocess_image(image_bytes: bytes, img_size: int = 224) -> torch.Tensor:
+def preprocess_image(image_bytes: bytes, img_size: int = IMG_SIZE) -> torch.Tensor:
     """
     이미지 전처리
     
@@ -659,7 +662,7 @@ async def analyze(
         model = load_model(animal_type)
         
         # 이미지 전처리
-        input_tensor = preprocess_image(image_bytes, img_size=224)
+        input_tensor = preprocess_image(image_bytes, img_size=IMG_SIZE)
         
         # 예측
         result = predict(model, input_tensor, animal_type)
