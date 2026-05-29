@@ -25,14 +25,16 @@ import json
 import os
 from collections import defaultdict
 from datetime import datetime
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
-from torch.amp import GradScaler
+import torch.optim as optim
+from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.utils.data import DataLoader
 from tqdm import tqdm
+from timm.utils import ModelEmaV2
 
 from models.classifier.dataset_random_split import (
     MEDICAL_DEVICES,
@@ -44,17 +46,236 @@ from models.classifier.losses import build_per_disease_losses
 from models.classifier.model import create_model, count_parameters
 from models.classifier.train import (
     Config as BaseTrainConfig,
+    _build_metrics,
     _build_optimizer,
+    _init_disease_stats,
     _mean_disease_metric,
     _print_disease_metrics,
-    _run_phase,
+    _run_forward_loss,
     get_device,
     resolve_batch_size,
     resolve_num_workers,
-    train_epoch,
-    validate_epoch,
 )
 from models.classifier.train_common import create_ema, ema_state_dict, eval_model
+
+
+def _train_epoch_ema(
+    model: nn.Module,
+    dataloader: DataLoader,
+    criterion_dict: nn.ModuleDict,
+    optimizer: optim.Optimizer,
+    device: str,
+    diseases: List[str],
+    *,
+    use_amp: bool = False,
+    scaler: Optional[GradScaler] = None,
+    grad_accum_steps: int = 1,
+    ema: Optional[ModelEmaV2] = None,
+) -> Dict[str, float]:
+    model.train()
+    total_loss = 0.0
+    d_losses, d_corrects, d_totals, d_recall = _init_disease_stats(diseases)
+    merged_recall = {d: defaultdict(int) for d in diseases}
+
+    optimizer.zero_grad(set_to_none=True)
+    progress = tqdm(dataloader, desc="Training")
+
+    for step, (images, labels) in enumerate(progress, start=1):
+        images = images.to(device)
+
+        with autocast("cuda", enabled=use_amp):
+            loss, batch_d_losses, batch_d_corrects, batch_d_totals, batch_recall = (
+                _run_forward_loss(model, criterion_dict, images, labels, diseases, device)
+            )
+            loss = loss / grad_accum_steps
+
+        if use_amp and scaler is not None:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
+
+        if step % grad_accum_steps == 0 or step == len(dataloader):
+            if use_amp and scaler is not None:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            optimizer.zero_grad(set_to_none=True)
+            if ema is not None:
+                ema.update(model)
+
+        total_loss += loss.item() * grad_accum_steps
+
+        for disease in diseases:
+            if disease in batch_d_totals:
+                d_losses[disease] += batch_d_losses[disease]
+                d_corrects[disease] += batch_d_corrects[disease]
+                d_totals[disease] += batch_d_totals[disease]
+                for k, v in batch_recall[disease].items():
+                    merged_recall[disease][k] += v
+
+        progress.set_postfix({"loss": loss.item() * grad_accum_steps})
+
+    return _build_metrics(
+        total_loss, len(dataloader), d_losses, d_corrects, d_totals, merged_recall, diseases
+    )
+
+
+@torch.no_grad()
+def _validate_epoch_ema(
+    model: nn.Module,
+    dataloader: DataLoader,
+    criterion_dict: nn.ModuleDict,
+    device: str,
+    diseases: List[str],
+    *,
+    use_amp: bool = False,
+    ema: Optional[ModelEmaV2] = None,
+) -> Dict[str, float]:
+    infer_model = eval_model(model, ema)
+    infer_model.eval()
+    total_loss = 0.0
+    d_losses, d_corrects, d_totals, _ = _init_disease_stats(diseases)
+    merged_recall = {d: defaultdict(int) for d in diseases}
+
+    progress = tqdm(dataloader, desc="Validation")
+
+    for images, labels in progress:
+        images = images.to(device)
+        with autocast("cuda", enabled=use_amp):
+            loss, batch_d_losses, batch_d_corrects, batch_d_totals, batch_recall = (
+                _run_forward_loss(infer_model, criterion_dict, images, labels, diseases, device)
+            )
+
+        total_loss += loss.item()
+        for disease in diseases:
+            if disease in batch_d_totals:
+                d_losses[disease] += batch_d_losses[disease]
+                d_corrects[disease] += batch_d_corrects[disease]
+                d_totals[disease] += batch_d_totals[disease]
+                for k, v in batch_recall[disease].items():
+                    merged_recall[disease][k] += v
+
+    return _build_metrics(
+        total_loss, len(dataloader), d_losses, d_corrects, d_totals, merged_recall, diseases
+    )
+
+
+def _run_phase_ema(
+    *,
+    phase: int,
+    epochs: int,
+    global_epoch_start: int,
+    model: nn.Module,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    criterion_dict: nn.ModuleDict,
+    optimizer: optim.Optimizer,
+    scheduler: CosineAnnealingLR,
+    device: str,
+    diseases: List[str],
+    config: BaseTrainConfig,
+    use_amp: bool,
+    scaler: Optional[GradScaler],
+    history: dict,
+    best_val_loss: float,
+    patience_counter: int,
+    best_path: str,
+    ema: Optional[ModelEmaV2] = None,
+) -> Tuple[float, int, str, int]:
+    print(f"\n{'=' * 60}")
+    print(
+        f"Phase {phase}: "
+        f"{'헤드만 학습 (백본 freeze)' if phase == 1 else '전체 미세조정 (unfreeze)'}"
+    )
+    print(f"  Epochs: {epochs}, LR: {config.HEAD_LR if phase == 1 else config.FINETUNE_LR}")
+    print(f"{'=' * 60}")
+
+    last_epoch = global_epoch_start
+
+    for local_ep in range(1, epochs + 1):
+        global_epoch = global_epoch_start + local_ep
+        last_epoch = global_epoch
+        print(f"\nEpoch {global_epoch} (Phase {phase} {local_ep}/{epochs})")
+        print("-" * 60)
+
+        train_metrics = _train_epoch_ema(
+            model,
+            train_loader,
+            criterion_dict,
+            optimizer,
+            device,
+            diseases,
+            use_amp=use_amp,
+            scaler=scaler,
+            grad_accum_steps=config.GRAD_ACCUM_STEPS,
+            ema=ema,
+        )
+        val_metrics = _validate_epoch_ema(
+            model,
+            val_loader,
+            criterion_dict,
+            device,
+            diseases,
+            use_amp=use_amp,
+            ema=ema,
+        )
+        scheduler.step()
+
+        train_acc = _mean_disease_metric(train_metrics, "_acc")
+        val_acc = _mean_disease_metric(val_metrics, "_acc")
+        acc_gap = train_acc - val_acc
+
+        print(f"\n[Train] Loss: {train_metrics['loss']:.4f}  Mean Acc: {train_acc:.4f}")
+        print(f"[Val]   Loss: {val_metrics['loss']:.4f}  Mean Acc: {val_acc:.4f}")
+        print(f"[Gap]   Train-Val Acc: {acc_gap:+.4f}  (과적합 모니터링)")
+
+        _print_disease_metrics("[Val]", val_metrics, diseases)
+
+        history["epochs"].append(
+            {
+                "epoch": global_epoch,
+                "phase": phase,
+                "train_loss": train_metrics["loss"],
+                "val_loss": val_metrics["loss"],
+                "train_acc_mean": train_acc,
+                "val_acc_mean": val_acc,
+                "acc_gap": acc_gap,
+                "lr": optimizer.param_groups[0]["lr"],
+            }
+        )
+        history["train_loss"].append(train_metrics["loss"])
+        history["val_loss"].append(val_metrics["loss"])
+        history["train_acc_mean"].append(train_acc)
+        history["val_acc_mean"].append(val_acc)
+        history["acc_gap"].append(acc_gap)
+
+        if val_metrics["loss"] < best_val_loss:
+            best_val_loss = val_metrics["loss"]
+            patience_counter = 0
+            torch.save(
+                {
+                    "epoch": global_epoch,
+                    "phase": phase,
+                    "model_state_dict": ema_state_dict(ema, model),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "val_loss": val_metrics["loss"],
+                    "val_acc_mean": val_acc,
+                    "task": "multitask_random_split",
+                    "animal_type": config.ANIMAL_TYPE,
+                    "ema_decay": 0.9998 if ema else None,
+                },
+                best_path,
+            )
+            tag = " (EMA weights)" if ema else ""
+            print(f"✓ Best 모델 저장: {best_path}{tag}")
+        else:
+            patience_counter += 1
+            if patience_counter >= config.PATIENCE:
+                print(f"\n⚠ Early Stopping (patience={config.PATIENCE}, val loss 기준)")
+                return best_val_loss, patience_counter, best_path, last_epoch
+
+    return best_val_loss, patience_counter, best_path, last_epoch
 
 
 class RandomSplitConfig(BaseTrainConfig):
@@ -283,7 +504,7 @@ def train():
     if not skip_phase1 and config.PHASE1_EPOCHS > 0:
         optimizer = _build_optimizer(model, phase=1, config=config)
         scheduler = CosineAnnealingLR(optimizer, T_max=config.PHASE1_EPOCHS)
-        best_val_loss, patience_counter, best_path, last_epoch = _run_phase(
+        best_val_loss, patience_counter, best_path, last_epoch = _run_phase_ema(
             phase=1,
             epochs=config.PHASE1_EPOCHS,
             global_epoch_start=0,
@@ -310,7 +531,7 @@ def train():
     if patience_counter < config.PATIENCE and config.PHASE2_EPOCHS > 0:
         optimizer = _build_optimizer(model, phase=2, config=config)
         scheduler = CosineAnnealingLR(optimizer, T_max=config.PHASE2_EPOCHS)
-        best_val_loss, patience_counter, best_path, last_epoch = _run_phase(
+        best_val_loss, patience_counter, best_path, last_epoch = _run_phase_ema(
             phase=2,
             epochs=config.PHASE2_EPOCHS,
             global_epoch_start=last_epoch,
