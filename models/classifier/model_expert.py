@@ -10,6 +10,7 @@ from typing import Tuple, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import timm
 
 from models.classifier.dataset_expert import get_disease_mapping
@@ -69,7 +70,8 @@ class ExpertDiseaseModel(nn.Module):
         features = self.relu(self.fc1(x))
         logits = self.fc2(self.head_drop2(features))
         if return_features:
-            return features, logits
+            # Center Loss 안정화: L2 단위 구면 embedding
+            return F.normalize(features, p=2, dim=1), logits
         return logits
 
     def freeze_backbone(self):

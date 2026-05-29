@@ -23,6 +23,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+import torch.nn.functional as F
 from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from torch.optim.swa_utils import AveragedModel, update_bn
@@ -71,8 +72,8 @@ class Config:
     USE_MIXUP = _env_flag("USE_MIXUP", "1")
     MIXUP_ALPHA = float(os.environ.get("MIXUP_ALPHA", "0.2"))
     USE_CENTER_LOSS = _env_flag("USE_CENTER_LOSS", "1")
-    CENTER_LOSS_LAMBDA = float(os.environ.get("CENTER_LOSS_LAMBDA", "0.01"))
-    CENTER_LR = float(os.environ.get("CENTER_LR", "0.5"))
+    CENTER_LOSS_LAMBDA = float(os.environ.get("CENTER_LOSS_LAMBDA", "0.001"))
+    CENTER_LR = float(os.environ.get("CENTER_LR", "0.05"))
     USE_SWA = _env_flag("USE_SWA", "0")
     SWA_EPOCHS = int(os.environ.get("SWA_EPOCHS", "5"))
 
@@ -89,10 +90,13 @@ class CenterLoss(nn.Module):
 
     def __init__(self, num_classes: int, feat_dim: int):
         super().__init__()
-        self.centers = nn.Parameter(torch.randn(num_classes, feat_dim))
+        self.centers = nn.Parameter(torch.zeros(num_classes, feat_dim))
+        nn.init.normal_(self.centers, std=0.01)
 
     def forward(self, features: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        return ((features - self.centers[labels]) ** 2).sum(dim=1).mean()
+        # features: model에서 L2 정규화됨 → centers도 단위 구면으로 맞춤
+        centers = F.normalize(self.centers, p=2, dim=1)
+        return ((features - centers[labels]) ** 2).sum(dim=1).mean()
 
 
 def mixup_data(
@@ -280,16 +284,13 @@ def _compute_batch_loss(
     center_loss: Optional[CenterLoss],
     center_lambda: float,
 ) -> torch.Tensor:
-    if labels_b is not None and lam != 1.0:
-        loss_ce = lam * criterion(logits, labels_a) + (1.0 - lam) * criterion(
+    # Mixup 배치: 정수 라벨 Center Loss 불가 → CE만
+    mixup_active = labels_b is not None
+
+    if mixup_active:
+        return lam * criterion(logits, labels_a) + (1.0 - lam) * criterion(
             logits, labels_b
         )
-        if center_loss is not None and features is not None:
-            loss_c = lam * center_loss(features, labels_a) + (1.0 - lam) * center_loss(
-                features, labels_b
-            )
-            return loss_ce + center_lambda * loss_c
-        return loss_ce
 
     loss_ce = criterion(logits, labels_a)
     if center_loss is not None and features is not None:
@@ -341,7 +342,12 @@ def _run_epoch(
 
         labels_a, labels_b, lam = labels, None, 1.0
         if is_train and use_mixup:
-            images, labels_a, labels_b, lam = mixup_data(images, labels, mixup_alpha)
+            # Center Loss 배치: mixup 스kip (정수 라벨 필요)
+            skip_mixup = use_center_loss and np.random.rand() < 0.5
+            if not skip_mixup:
+                images, labels_a, labels_b, lam = mixup_data(
+                    images, labels, mixup_alpha
+                )
 
         if is_train:
             with autocast("cuda", enabled=use_amp):
@@ -371,10 +377,10 @@ def _run_epoch(
                     scaler.update()
                 else:
                     optimizer.step()
-                if center_optimizer is not None:
+                if center_optimizer is not None and use_center_loss:
                     center_optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-                if center_optimizer is not None:
+                if center_optimizer is not None and use_center_loss:
                     center_optimizer.zero_grad(set_to_none=True)
 
             total_loss += loss.item() * grad_accum_steps
@@ -447,10 +453,15 @@ def _run_phase(
 ) -> Tuple[float, int, str, int]:
     print(f"\n{'=' * 60}")
     print(f"Phase {phase}: {'헤드만 (freeze)' if phase == 1 else '전체 미세조정'}")
+    if phase == 1:
+        print("  → Center Loss OFF (Phase 2부터 적용)")
+    elif config.USE_CENTER_LOSS:
+        print(f"  → Center Loss ON (λ={config.CENTER_LOSS_LAMBDA}, lr={config.CENTER_LR})")
     print(f"{'=' * 60}")
 
     last_epoch = global_epoch_start
     swa_start_local = max(1, epochs - config.SWA_EPOCHS + 1)
+    phase_use_center = config.USE_CENTER_LOSS and phase == 2
 
     for local_ep in range(1, epochs + 1):
         global_epoch = global_epoch_start + local_ep
@@ -473,7 +484,7 @@ def _run_phase(
             grad_accum_steps=config.GRAD_ACCUM_STEPS,
             use_mixup=config.USE_MIXUP,
             mixup_alpha=config.MIXUP_ALPHA,
-            use_center_loss=config.USE_CENTER_LOSS,
+            use_center_loss=phase_use_center,
             center_lambda=config.CENTER_LOSS_LAMBDA,
         )
         _, val_m = _run_epoch(
@@ -665,7 +676,7 @@ def train():
     if config.USE_CENTER_LOSS:
         center_loss = CenterLoss(num_classes, FEAT_DIM).to(device)
         center_optimizer = optim.SGD(center_loss.parameters(), lr=config.CENTER_LR)
-        print(f"✓ Center Loss 활성 (feat_dim={FEAT_DIM}, center_lr={config.CENTER_LR})")
+        print(f"✓ Center Loss (Phase 2 전용, feat_dim={FEAT_DIM}, center_lr={config.CENTER_LR})")
 
     swa_model: Optional[AveragedModel] = None
     if config.USE_SWA:
