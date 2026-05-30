@@ -7,6 +7,7 @@ VL 폴더는 device 편향이 있어 사용하지 않습니다.
   MODE=multitask|group|subgroup  (기본 multitask)
   GROUP_NAME=안검             — MODE=subgroup 일 때 필수
   MAX_PER_CLASS=5000            — 클래스당 상한 (group/subgroup, 0=무제한)
+  DISEASE_CAPS='{"핵경화":7000,...}' — 질환별 cap (미명시 질환은 MAX_PER_CLASS/stratum)
   SPLIT_SEED=42
   VAL_RATIO=0.2
   USE_GROUP_SPLIT=1  — crop_D* 그룹 단위 분할 (기본 ON)
@@ -88,6 +89,22 @@ def resolve_max_per_class(max_per_class: Optional[int] = None) -> Optional[int]:
     if raw.isdigit() and int(raw) > 0:
         return int(raw)
     return None
+
+
+def resolve_disease_caps(disease_caps: Optional[Dict[str, int]] = None) -> Dict[str, int]:
+    """DISEASE_CAPS JSON — 질환명 → cap (질환 전체 strata 합산)."""
+    if disease_caps is not None:
+        return {k: int(v) for k, v in disease_caps.items() if int(v) > 0}
+    raw = os.environ.get("DISEASE_CAPS", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"DISEASE_CAPS JSON 파싱 실패: {e}") from e
+    if not isinstance(data, dict):
+        raise ValueError("DISEASE_CAPS는 JSON 객체여야 합니다.")
+    return {str(k): int(v) for k, v in data.items() if int(v) > 0}
 
 
 def get_tl_paths(animal_type: str) -> List[str]:
@@ -207,27 +224,58 @@ def apply_max_per_class_cap(
     seed: int,
 ) -> Tuple[List[SampleMeta], Dict[str, object]]:
     """stratum(클래스)당 max_per_class 초과분 랜덤 서브샘플."""
+    return apply_sample_caps(metas, max_per_class=max_per_class, disease_caps=None, seed=seed)
+
+
+def apply_sample_caps(
+    metas: Sequence[SampleMeta],
+    *,
+    max_per_class: Optional[int] = None,
+    disease_caps: Optional[Dict[str, int]] = None,
+    seed: int = 42,
+) -> Tuple[List[SampleMeta], Dict[str, object]]:
+    """샘플 cap — DISEASE_CAPS 질환은 질환 단위, 나머지는 stratum×MAX_PER_CLASS."""
+    disease_caps = disease_caps or {}
+    if not max_per_class and not disease_caps:
+        return list(metas), {}
+
     rng = random.Random(seed)
-    by_stratum: Dict[str, List[SampleMeta]] = defaultdict(list)
+    groups: Dict[str, List[SampleMeta]] = defaultdict(list)
+    limits: Dict[str, int] = {}
+
     for m in metas:
-        by_stratum[m.stratum].append(m)
+        if m.disease in disease_caps:
+            key = f"disease:{m.disease}"
+            limits[key] = disease_caps[m.disease]
+        elif max_per_class:
+            key = f"stratum:{m.stratum}"
+            limits[key] = max_per_class
+        else:
+            key = f"pass:{m.index}"
+            limits[key] = 10**12
+        groups[key].append(m)
 
     capped: List[SampleMeta] = []
     stats: Dict[str, object] = {}
-    for stratum, items in sorted(by_stratum.items()):
+    for key, items in sorted(groups.items()):
         before = len(items)
-        if before > max_per_class:
+        limit = limits[key]
+        if before > limit:
             rng.shuffle(items)
-            items = items[:max_per_class]
+            items = items[:limit]
         capped.extend(items)
-        stats[stratum] = {"before": before, "after": len(items)}
+        stats[key] = {"before": before, "after": len(items), "limit": limit}
 
     rng.shuffle(capped)
-    print(f"\n✂️  MAX_PER_CLASS={max_per_class:,} (seed={seed})")
-    for stratum, st in stats.items():
-        b, a = st["before"], st["after"]
+    print(f"\n✂️  Sample cap (seed={seed})")
+    if max_per_class:
+        print(f"  MAX_PER_CLASS (stratum): {max_per_class:,}")
+    if disease_caps:
+        print(f"  DISEASE_CAPS: {disease_caps}")
+    for key, st in stats.items():
+        b, a, lim = st["before"], st["after"], st["limit"]
         note = f" → {a:,}" if b != a else ""
-        print(f"  {stratum}: {b:,}{note}")
+        print(f"  [{key}] limit={lim:,}: {b:,}{note}")
     print(f"  Total: {len(metas):,} → {len(capped):,}")
     return capped, stats
 
@@ -624,6 +672,7 @@ def create_random_split_dataloaders(
     mode: Optional[str] = None,
     group_name: Optional[str] = None,
     max_per_class: Optional[int] = None,
+    disease_caps: Optional[Dict[str, int]] = None,
     aug_preset: str = "train",
 ) -> Tuple[DataLoader, DataLoader, Dataset, Dataset, Dict[str, object]]:
     """TL 수집 → (필터/cap) → random split → train/val DataLoader.
@@ -635,6 +684,7 @@ def create_random_split_dataloaders(
     """
     split_mode = resolve_split_mode(mode)
     cap = resolve_max_per_class(max_per_class)
+    d_caps = resolve_disease_caps(disease_caps)
     seed = int(os.environ.get("SPLIT_SEED", "42"))
     group_name = (group_name or os.environ.get("GROUP_NAME", "")).strip() or None
     tl_paths = get_tl_paths(animal_type)
@@ -644,6 +694,8 @@ def create_random_split_dataloaders(
         print(f"  GROUP_NAME={group_name}")
     if cap:
         print(f"  MAX_PER_CLASS={cap:,}")
+    if d_caps:
+        print(f"  DISEASE_CAPS={d_caps}")
 
     if aug_preset == "rand":
         from models.classifier.dataset_augment import rand_augment_transforms
@@ -673,8 +725,10 @@ def create_random_split_dataloaders(
         )
 
     cap_stats: Optional[Dict[str, object]] = None
-    if cap is not None:
-        metas, cap_stats = apply_max_per_class_cap(metas, cap, seed)
+    if cap is not None or d_caps:
+        metas, cap_stats = apply_sample_caps(
+            metas, max_per_class=cap, disease_caps=d_caps, seed=seed,
+        )
 
     train_idx, val_idx, split_meta = split_indices_from_metas(metas)
     device_map = {m.index: m.device for m in metas}
@@ -742,6 +796,7 @@ def create_random_split_dataloaders(
         "mode": split_mode,
         "group_name": group_name,
         "max_per_class": cap,
+        "disease_caps": d_caps or None,
         "cap_stats": cap_stats,
         "distribution": dist,
         "tl_paths": tl_paths,

@@ -15,6 +15,7 @@ TL Random Val (SPLIT_SEED=42, VAL_RATIO=0.2) 비정상 샘플만 사용.
   CHECKPOINT=  — 기본 models/classifier/checkpoints/{animal}_best_random_split.pth
   BATCH_SIZE=32
   IMG_SIZE=300
+  DISEASE_WEIGHTS='{"백내장":0.8}'  — Top-K 재정렬용 질환별 가중 (미명시=1.0)
 """
 
 from __future__ import annotations
@@ -48,6 +49,24 @@ from models.classifier.train import get_device, resolve_batch_size, resolve_num_
 from models.classifier.train_random_split import RandomSplitConfig
 
 TOP_KS = (1, 2, 3, 5)
+
+
+def resolve_disease_weights(
+    disease_weights: Optional[Dict[str, float]] = None,
+) -> Dict[str, float]:
+    """DISEASE_WEIGHTS JSON — 질환별 후처리 가중 (기본 1.0)."""
+    if disease_weights is not None:
+        return {k: float(v) for k, v in disease_weights.items()}
+    raw = os.environ.get("DISEASE_WEIGHTS", "").strip()
+    if not raw:
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"DISEASE_WEIGHTS JSON 파싱 실패: {e}") from e
+    if not isinstance(data, dict):
+        raise ValueError("DISEASE_WEIGHTS는 JSON 객체여야 합니다.")
+    return {str(k): float(v) for k, v in data.items()}
 
 
 def resolve_checkpoint(animal_type: str) -> Path:
@@ -88,11 +107,14 @@ def _rank_diseases_by_abnormal_prob(
     outputs: Dict[str, torch.Tensor],
     sample_i: int,
     diseases: Sequence[str],
+    disease_weights: Optional[Dict[str, float]] = None,
 ) -> List[Tuple[str, float]]:
-    scored = [
-        (d, head_abnormal_probability(outputs[d][sample_i]))
-        for d in diseases
-    ]
+    weights = disease_weights or {}
+    scored = []
+    for d in diseases:
+        prob = head_abnormal_probability(outputs[d][sample_i])
+        w = weights.get(d, 1.0)
+        scored.append((d, prob * w))
     scored.sort(key=lambda x: (-x[1], x[0]))
     return scored
 
@@ -112,6 +134,7 @@ def evaluate_multitask_topk(
     val_loader: DataLoader,
     diseases: List[str],
     device: str,
+    disease_weights: Optional[Dict[str, float]] = None,
 ) -> Dict[str, object]:
     model.eval()
 
@@ -151,7 +174,9 @@ def evaluate_multitask_topk(
                 local_idx += 1
                 continue
 
-            ranked = _rank_diseases_by_abnormal_prob(outputs, i, diseases)
+            ranked = _rank_diseases_by_abnormal_prob(
+                outputs, i, diseases, disease_weights,
+            )
             ranked_names = [d for d, _ in ranked]
             pred_top1 = ranked_names[0]
 
@@ -200,6 +225,7 @@ def evaluate_multitask_topk(
     cm_matrix = [[cm[gt][pred] for pred in diseases] for gt in diseases]
 
     return {
+        "disease_weights": disease_weights or {},
         "n_abnormal": total,
         "n_skipped_normal": skipped_normal,
         "topk_accuracy": topk_acc,
@@ -215,8 +241,14 @@ def evaluate_multitask_topk(
 
 def print_results(report: Dict[str, object], diseases: List[str]) -> None:
     n = report["n_abnormal"]
+    weights = report.get("disease_weights") or {}
     print(f"\n{'=' * 64}")
     print(f"📊 Top-K accuracy (비정상 n={n:,}, 정상 skip={report['n_skipped_normal']:,})")
+    if weights:
+        applied = {d: weights[d] for d in diseases if d in weights}
+        print(f"  DISEASE_WEIGHTS 적용: {applied}")
+    else:
+        print("  DISEASE_WEIGHTS: (미적용, 전부 1.0)")
     print(f"{'=' * 64}")
     for k in TOP_KS:
         acc = report["topk_accuracy"][f"top_{k}"]
@@ -297,6 +329,12 @@ def main() -> None:
     print(f"  VAL_RATIO={os.environ.get('VAL_RATIO', '0.2')}")
     print("  평가 대상: TL Random Val · 비정상 샘플만")
 
+    disease_weights = resolve_disease_weights()
+    if disease_weights:
+        print(f"  DISEASE_WEIGHTS={disease_weights}")
+    else:
+        print("  DISEASE_WEIGHTS: (미설정)")
+
     checkpoint = resolve_checkpoint(animal_type)
     print(f"  checkpoint: {checkpoint}")
 
@@ -317,7 +355,9 @@ def main() -> None:
         mode="multitask",
     )
 
-    report = evaluate_multitask_topk(model, val_ds, val_loader, diseases, device)
+    report = evaluate_multitask_topk(
+        model, val_ds, val_loader, diseases, device, disease_weights,
+    )
     print_results(report, diseases)
 
     out_path = save_results(animal_type, checkpoint, split_meta, report)
