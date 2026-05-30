@@ -194,9 +194,9 @@ class EyeDiseaseDataset(Dataset):
                         except Exception as e:
                             continue
         
-        # 질환별+클래스별 최대 샘플 수 제한
-        # 고양이도 소수 클래스(결막염 유 등) 학습량 확보를 위해 상한 완화
-        MAX_PER_DISEASE_CLASS = 2500 if self.animal_type == "cat" else 3000
+        # 1차 cap — DATASET_PRIMARY_CAP (기본 50000, 사실상 무제한)
+        # dataset_random_split.py의 MAX_PER_CLASS / DISEASE_CAPS가 2차 cap으로 적용됨
+        MAX_PER_DISEASE_CLASS = int(os.environ.get("DATASET_PRIMARY_CAP", "50000"))
         from collections import defaultdict
         disease_class_counts = defaultdict(int)
         filtered = []
