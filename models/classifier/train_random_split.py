@@ -418,6 +418,100 @@ def evaluate_device_subsets(
     return report
 
 
+@torch.no_grad()
+def evaluate_device_subsets_single(
+    model: nn.Module,
+    val_dataset,
+    val_loader: DataLoader,
+    device: str,
+) -> Dict[str, object]:
+    """단일 라벨(group/subgroup) Val device subset accuracy."""
+    model.eval()
+    buckets = {
+        "all": {"correct": 0, "total": 0},
+        SMARTPHONE: {"correct": 0, "total": 0},
+        "medical": {"correct": 0, "total": 0},
+        "smartphone_abnormal": {"correct": 0, "total": 0},
+    }
+    per_device: Dict[str, Dict[str, int]] = defaultdict(lambda: {"correct": 0, "total": 0})
+
+    local_idx = 0
+    for images, labels in tqdm(val_loader, desc="Device subset eval"):
+        images = images.to(device)
+        labels = labels.to(device)
+        outputs = model(images)
+        preds = torch.argmax(outputs, dim=1)
+        bs = images.size(0)
+
+        for i in range(bs):
+            if local_idx >= len(val_dataset):
+                break
+            dev = val_dataset.get_device(local_idx)
+            ok = preds[i].item() == labels[i].item()
+
+            buckets["all"]["total"] += 1
+            buckets["all"]["correct"] += int(ok)
+            per_device[dev]["total"] += 1
+            per_device[dev]["correct"] += int(ok)
+
+            if dev == SMARTPHONE:
+                buckets[SMARTPHONE]["total"] += 1
+                buckets[SMARTPHONE]["correct"] += int(ok)
+                buckets["smartphone_abnormal"]["total"] += 1
+                buckets["smartphone_abnormal"]["correct"] += int(ok)
+            elif dev in MEDICAL_DEVICES:
+                buckets["medical"]["total"] += 1
+                buckets["medical"]["correct"] += int(ok)
+
+            local_idx += 1
+
+    def _acc(cell: Dict[str, int]) -> float:
+        return cell["correct"] / cell["total"] if cell["total"] else 0.0
+
+    device_accs = {
+        dev: _acc(v) for dev, v in sorted(per_device.items()) if v["total"] > 0
+    }
+    acc_values = list(device_accs.values())
+    dependency = max(acc_values) - min(acc_values) if len(acc_values) >= 2 else 0.0
+
+    report = {
+        "val_mean_acc_all": _acc(buckets["all"]),
+        "val_smartphone_acc": _acc(buckets[SMARTPHONE]),
+        "val_medical_acc": _acc(buckets["medical"]),
+        "val_smartphone_abnormal_acc": _acc(buckets["smartphone_abnormal"]),
+        "device_accuracies": device_accs,
+        "device_dependency_score": dependency,
+        "counts": {
+            "all": buckets["all"]["total"],
+            SMARTPHONE: buckets[SMARTPHONE]["total"],
+            "medical": buckets["medical"]["total"],
+            "smartphone_abnormal": buckets["smartphone_abnormal"]["total"],
+        },
+    }
+
+    print(f"\n{'=' * 64}")
+    print("📱 Val device subset 평가 (단일 class accuracy, 비정상 전용)")
+    print(f"{'=' * 64}")
+    print(f"  전체:              acc={report['val_mean_acc_all']:.4f}  n={report['counts']['all']:,}")
+    print(
+        f"  스마트폰:            acc={report['val_smartphone_acc']:.4f}  "
+        f"n={report['counts'][SMARTPHONE]:,}"
+    )
+    print(
+        f"  스마트폰+비정상:     acc={report['val_smartphone_abnormal_acc']:.4f}  "
+        f"n={report['counts']['smartphone_abnormal']:,}"
+    )
+    print(
+        f"  의료장비:            acc={report['val_medical_acc']:.4f}  "
+        f"n={report['counts']['medical']:,}"
+    )
+    for dev, acc in device_accs.items():
+        print(f"    [{dev}] acc={acc:.4f}  n={per_device[dev]['total']:,}")
+    print(f"  Device 의존성 (max-min acc): {dependency:.4f}  ← 낮을수록 좋음")
+
+    return report
+
+
 def train():
     config = RandomSplitConfig()
     os.makedirs(config.OUTPUT_DIR, exist_ok=True)
