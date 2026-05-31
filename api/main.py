@@ -35,7 +35,12 @@ from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.lib.enums import TA_CENTER, TA_LEFT
 
-from models.classifier.model import create_model
+from models.classifier.inference_multitask import (
+    load_multitask_model,
+    resolve_checkpoint_dir,
+    resolve_model_version,
+    run_multitask_inference,
+)
 from models.classifier.dataset import get_transforms
 
 # .env 파일 로드
@@ -51,8 +56,8 @@ IMG_SIZE = 300
 # FastAPI 앱 생성
 app = FastAPI(
     title="반려동물 안구 질환 분석 API",
-    description="EfficientNet-B3 기반 멀티태스크 질환 분류",
-    version="1.0.0"
+    description="EfficientNet-B3 멀티태스크 질환 분류 (random split)",
+    version="2.0.0"
 )
 
 # CORS 설정
@@ -64,8 +69,8 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# 전역 변수: 모델 캐시
-models_cache = {}
+# 전역 변수: 모델 캐시 {animal_type: {"model", "path", "meta"}}
+models_cache: Dict[str, dict] = {}
 device = None
 
 # Claude API 클라이언트
@@ -81,19 +86,36 @@ class DiseasePrediction(BaseModel):
     confidence: float
 
 
+class TopDiseaseItem(BaseModel):
+    disease: str
+    confidence: float
+
+
 class PredictionResponse(BaseModel):
-    """예측 결과 응답 모델"""
+    """예측 결과 — 레거시 필드 + Top-K 확장."""
     predictions: Dict[str, DiseasePrediction]
     main_disease: str
     main_confidence: float
     is_normal: bool
+    binary_result: str
+    confidence: float
+    top_3_diseases: List[TopDiseaseItem]
+    all_diseases: Dict[str, float]
+    device_warning: Optional[str] = None
+    recommendation: str
+    model_version: str
+    checkpoint: str
+    disclaimer: str
 
 
 class HealthResponse(BaseModel):
     """헬스체크 응답 모델"""
     status: str
     device: str
+    model_version: str
+    checkpoint_dir: str
     models_loaded: Dict[str, bool]
+    checkpoints: Dict[str, Optional[str]]
 
 
 class ReportRequest(BaseModel):
@@ -140,45 +162,34 @@ def get_device():
 
 
 def load_model(animal_type: str):
-    """
-    모델 로드 (캐싱)
-    
-    Args:
-        animal_type: 'dog' 또는 'cat'
-    
-    Returns:
-        model: 로드된 모델
-    """
+    """멀티태스크 모델 로드 (캐싱, EMA weights 지원)."""
     global models_cache, device
-    
-    # 이미 로드된 모델이면 캐시에서 반환
+
     if animal_type in models_cache:
-        return models_cache[animal_type]
-    
+        return models_cache[animal_type]["model"]
+
     try:
-        # 모델 생성
-        model = create_model(animal_type=animal_type, pretrained=False)
-        
-        # 체크포인트 로드
-        checkpoint_path = f'models/classifier/checkpoints/{animal_type}_best.pth'
-        
-        if not Path(checkpoint_path).exists():
-            raise FileNotFoundError(f"체크포인트를 찾을 수 없습니다: {checkpoint_path}")
-        
-        logger.info(f"{animal_type.upper()} 모델 로드 중: {checkpoint_path}")
-        ckpt = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(ckpt['model_state_dict'])
-        
-        model = model.to(device)
-        model.eval()
-        
-        # 캐시에 저장
-        models_cache[animal_type] = model
-        
-        logger.info(f"✓ {animal_type.upper()} 모델 로드 완료")
-        
+        override = os.environ.get(f"MODEL_CHECKPOINT_{animal_type.upper()}", "").strip() or None
+        model, path, ckpt = load_multitask_model(
+            animal_type,
+            device,
+            checkpoint_override=override,
+        )
+        models_cache[animal_type] = {
+            "model": model,
+            "path": str(path),
+            "meta": {
+                "task": ckpt.get("task", "unknown"),
+                "epoch": ckpt.get("epoch"),
+                "val_acc_mean": ckpt.get("val_acc_mean"),
+            },
+        }
+        logger.info(
+            f"✓ {animal_type.upper()} 모델 로드: {path} "
+            f"(MODEL_VERSION={resolve_model_version()}, task={ckpt.get('task')})"
+        )
         return model
-    
+
     except Exception as e:
         logger.error(f"모델 로드 실패 ({animal_type}): {e}")
         raise HTTPException(status_code=500, detail=f"모델 로드 실패: {str(e)}")
@@ -217,71 +228,45 @@ def preprocess_image(image_bytes: bytes, img_size: int = IMG_SIZE) -> torch.Tens
         raise HTTPException(status_code=400, detail=f"이미지 전처리 실패: {str(e)}")
 
 
-def predict(model, input_tensor: torch.Tensor, animal_type: str) -> PredictionResponse:
-    """
-    예측 수행
-    
-    Args:
-        model: 모델
-        input_tensor: 입력 텐서 [1, 3, H, W]
-        animal_type: 'dog' 또는 'cat'
-    
-    Returns:
-        PredictionResponse: 예측 결과
-    """
+def predict(
+    model,
+    input_tensor: torch.Tensor,
+    animal_type: str,
+    device_meta: Optional[str] = None,
+) -> PredictionResponse:
+    """멀티태스크 Top-K 추론."""
     try:
-        # 추론
-        with torch.no_grad():
-            input_tensor = input_tensor.to(device)
-            outputs = model(input_tensor)
-        
-        # 질환 리스트 및 라벨 맵
-        diseases = model.get_disease_names()
-        label_map = model.get_label_map()
-        
-        # 예측 결과 파싱
-        predictions = {}
-        max_confidence = 0.0
-        main_disease = ""
-        
-        for disease in diseases:
-            logits = outputs[disease]
-            probs = torch.softmax(logits, dim=1)
-            confidence, predicted_class = torch.max(probs, dim=1)
-            
-            confidence_value = confidence.item() * 100
-            predicted_idx = predicted_class.item()
-            
-            # 라벨 맵에서 클래스 이름 가져오기
-            class_names = list(label_map[disease].keys())
-            predicted_label = class_names[predicted_idx]
-            
-            predictions[disease] = {
-                "label": predicted_label,
-                "confidence": round(confidence_value, 1)
-            }
-            
-            # "무"가 아닌 질환 중 가장 높은 confidence 찾기
-            if predicted_label != "무" and confidence_value > max_confidence:
-                max_confidence = confidence_value
-                main_disease = disease
-        
-        # 모든 질환이 "무"인 경우
-        is_normal = (main_disease == "")
-        if is_normal:
-            # 가장 높은 confidence를 가진 질환 선택 (모두 무일 때)
-            for disease, pred in predictions.items():
-                if pred["confidence"] > max_confidence:
-                    max_confidence = pred["confidence"]
-                    main_disease = disease
-        
+        raw = run_multitask_inference(
+            model,
+            input_tensor,
+            device=device,
+            top_k=int(os.environ.get("TOP_K_DISEASES", "3")),
+            device_meta=device_meta,
+        )
+        cache = models_cache.get(animal_type, {})
+
+        predictions = {
+            k: DiseasePrediction(label=v["label"], confidence=v["confidence"])
+            for k, v in raw["predictions"].items()
+        }
+        top_3 = [TopDiseaseItem(**item) for item in raw["top_3_diseases"]]
+
         return PredictionResponse(
             predictions=predictions,
-            main_disease=main_disease,
-            main_confidence=round(max_confidence, 1),
-            is_normal=is_normal
+            main_disease=raw["main_disease"],
+            main_confidence=raw["main_confidence"],
+            is_normal=raw["is_normal"],
+            binary_result=raw["binary_result"],
+            confidence=raw["confidence"],
+            top_3_diseases=top_3,
+            all_diseases=raw["all_diseases"],
+            device_warning=raw["device_warning"],
+            recommendation=raw["recommendation"],
+            model_version=resolve_model_version(),
+            checkpoint=cache.get("path", ""),
+            disclaimer=raw["disclaimer"],
         )
-    
+
     except Exception as e:
         logger.error(f"예측 실패: {e}")
         raise HTTPException(status_code=500, detail=f"예측 실패: {str(e)}")
@@ -561,6 +546,7 @@ async def startup_event():
     
     device = get_device()
     logger.info(f"디바이스: {device}")
+    logger.info(f"MODEL_VERSION={resolve_model_version()}  dir={resolve_checkpoint_dir()}")
     
     # 한글 폰트 설정
     logger.info("한글 폰트 설정 중...")
@@ -601,7 +587,8 @@ async def root():
     """루트 엔드포인트"""
     return {
         "message": "반려동물 안구 질환 분석 API",
-        "version": "1.0.0",
+        "version": "2.0.0",
+        "model_version": resolve_model_version(),
         "endpoints": {
             "analyze": "POST /api/ai/analyze",
             "report": "POST /api/ai/report",
@@ -615,20 +602,28 @@ async def root():
 @app.get("/health", response_model=HealthResponse, tags=["Health"])
 async def health_check():
     """헬스체크 엔드포인트"""
+    checkpoints = {
+        animal: (models_cache[animal]["path"] if animal in models_cache else None)
+        for animal in ("dog", "cat")
+    }
     return HealthResponse(
         status="healthy",
-        device=device,
+        device=str(device),
+        model_version=resolve_model_version(),
+        checkpoint_dir=str(resolve_checkpoint_dir()),
         models_loaded={
             "dog": "dog" in models_cache,
-            "cat": "cat" in models_cache
-        }
+            "cat": "cat" in models_cache,
+        },
+        checkpoints=checkpoints,
     )
 
 
 @app.post("/api/ai/analyze", response_model=PredictionResponse, tags=["AI"])
 async def analyze(
     file: UploadFile = File(...),
-    animal_type: str = Form(...)
+    animal_type: str = Form(...),
+    device: Optional[str] = Form(None),
 ):
     """
     안구 질환 분석 엔드포인트
@@ -665,9 +660,12 @@ async def analyze(
         input_tensor = preprocess_image(image_bytes, img_size=IMG_SIZE)
         
         # 예측
-        result = predict(model, input_tensor, animal_type)
+        result = predict(model, input_tensor, animal_type, device_meta=device)
         
-        logger.info(f"분석 완료: {animal_type} - {result.main_disease} ({result.main_confidence}%)")
+        logger.info(
+            f"분석 완료: {animal_type} - {result.binary_result} "
+            f"top={result.main_disease} ({result.confidence:.2%})"
+        )
         
         return result
     
