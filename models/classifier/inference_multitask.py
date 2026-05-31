@@ -51,8 +51,8 @@ def checkpoint_path_for(animal_type: str, version: Optional[str] = None) -> Path
 
 
 def extract_state_dict(checkpoint: Dict[str, Any]) -> Dict[str, torch.Tensor]:
-    """EMA / model_state_dict / state_dict 자동 인식."""
-    for key in ("model_state_dict", "model_state_ema", "state_dict"):
+    """EMA / model_state_dict / state_dict 자동 인식 (EMA 우선)."""
+    for key in ("model_state_ema", "model_state_dict", "state_dict"):
         if key in checkpoint and isinstance(checkpoint[key], dict):
             return checkpoint[key]
     raise KeyError(

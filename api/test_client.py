@@ -27,6 +27,7 @@ def test_health(base_url: str = "http://localhost:8000") -> bool:
         print(f"\n상태: {data['status']}")
         print(f"device: {data.get('device')}")
         print(f"model_version: {data.get('model_version')}")
+        print(f"inference_backend: {data.get('inference_backend')}")
         print(f"checkpoint_dir: {data.get('checkpoint_dir')}")
         print("\n모델 로드:")
         for name, loaded in data.get("models_loaded", {}).items():

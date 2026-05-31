@@ -15,6 +15,7 @@ import torch
 import numpy as np
 from PIL import Image
 import io
+import json
 import logging
 import os
 import sys
@@ -40,6 +41,12 @@ from models.classifier.inference_multitask import (
     resolve_checkpoint_dir,
     resolve_model_version,
     run_multitask_inference,
+)
+from api.inference_onnx import (
+    load_onnx_model,
+    resolve_inference_backend,
+    run_onnx_inference,
+    uses_onnx_backend,
 )
 from models.classifier.dataset import get_transforms
 
@@ -113,6 +120,7 @@ class HealthResponse(BaseModel):
     status: str
     device: str
     model_version: str
+    inference_backend: str
     checkpoint_dir: str
     models_loaded: Dict[str, bool]
     checkpoints: Dict[str, Optional[str]]
@@ -162,31 +170,46 @@ def get_device():
 
 
 def load_model(animal_type: str):
-    """멀티태스크 모델 로드 (캐싱, EMA weights 지원)."""
+    """멀티태스크 모델 로드 (PyTorch / ONNX, 캐싱)."""
     global models_cache, device
 
     if animal_type in models_cache:
         return models_cache[animal_type]["model"]
 
+    backend = resolve_inference_backend()
+    override_env = f"MODEL_CHECKPOINT_{animal_type.upper()}"
+    override = os.environ.get(override_env, "").strip() or None
+
     try:
-        override = os.environ.get(f"MODEL_CHECKPOINT_{animal_type.upper()}", "").strip() or None
-        model, path, ckpt = load_multitask_model(
-            animal_type,
-            device,
-            checkpoint_override=override,
-        )
-        models_cache[animal_type] = {
-            "model": model,
-            "path": str(path),
-            "meta": {
+        if uses_onnx_backend(backend):
+            use_int8 = backend == "onnx_int8"
+            model, path = load_onnx_model(
+                animal_type,
+                int8=use_int8,
+                checkpoint_override=override,
+            )
+            meta = {"task": "multitask_random_split", "backend": backend}
+        else:
+            model, path, ckpt = load_multitask_model(
+                animal_type,
+                device,
+                checkpoint_override=override,
+            )
+            meta = {
                 "task": ckpt.get("task", "unknown"),
                 "epoch": ckpt.get("epoch"),
                 "val_acc_mean": ckpt.get("val_acc_mean"),
-            },
+                "backend": backend,
+            }
+
+        models_cache[animal_type] = {
+            "model": model,
+            "path": str(path),
+            "meta": meta,
         }
         logger.info(
             f"✓ {animal_type.upper()} 모델 로드: {path} "
-            f"(MODEL_VERSION={resolve_model_version()}, task={ckpt.get('task')})"
+            f"(backend={backend}, MODEL_VERSION={resolve_model_version()})"
         )
         return model
 
@@ -236,13 +259,23 @@ def predict(
 ) -> PredictionResponse:
     """멀티태스크 Top-K 추론."""
     try:
-        raw = run_multitask_inference(
-            model,
-            input_tensor,
-            device=device,
-            top_k=int(os.environ.get("TOP_K_DISEASES", "3")),
-            device_meta=device_meta,
-        )
+        backend = resolve_inference_backend()
+        top_k = int(os.environ.get("TOP_K_DISEASES", "3"))
+        if uses_onnx_backend(backend):
+            raw = run_onnx_inference(
+                model,
+                input_tensor,
+                top_k=top_k,
+                device_meta=device_meta,
+            )
+        else:
+            raw = run_multitask_inference(
+                model,
+                input_tensor,
+                device=device,
+                top_k=top_k,
+                device_meta=device_meta,
+            )
         cache = models_cache.get(animal_type, {})
 
         predictions = {
@@ -546,6 +579,7 @@ async def startup_event():
     
     device = get_device()
     logger.info(f"디바이스: {device}")
+    logger.info(f"INFERENCE_BACKEND={resolve_inference_backend()}")
     logger.info(f"MODEL_VERSION={resolve_model_version()}  dir={resolve_checkpoint_dir()}")
     
     # 한글 폰트 설정
@@ -610,6 +644,7 @@ async def health_check():
         status="healthy",
         device=str(device),
         model_version=resolve_model_version(),
+        inference_backend=resolve_inference_backend(),
         checkpoint_dir=str(resolve_checkpoint_dir()),
         models_loaded={
             "dog": "dog" in models_cache,
@@ -782,7 +817,6 @@ JSON만 출력하고 다른 설명은 불필요합니다."""
         
         response_text = response_text.strip()
         
-        import json
         report_data = json.loads(response_text)
         
         # disease_analysis가 없으면 빈 dict 사용
