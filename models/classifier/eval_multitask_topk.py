@@ -16,10 +16,17 @@ TL Random Val (SPLIT_SEED=42, VAL_RATIO=0.2) 비정상 샘플만 사용.
   BATCH_SIZE=32
   IMG_SIZE=300
   DISEASE_WEIGHTS='{"백내장":0.8}'  — Top-K 재정렬용 질환별 가중 (미명시=1.0)
+  EXCLUDE_HEADS=백내장  — Top-K 경쟁에서 제외할 헤드 (쉼표 구분, 재학습 없이 시뮬레이션)
+
+예시 (백내장 제외 시뮬레이션):
+  CHECKPOINT=models/classifier/checkpoints/dog_best_random_split.pth \\
+  EXCLUDE_HEADS=백내장 python models/classifier/eval_multitask_topk.py \\
+    --animal dog --device cuda --batch-size 64
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
@@ -44,11 +51,26 @@ from models.classifier.dataset_random_split import (
     RandomSplitEyeDataset,
     create_random_split_dataloaders,
 )
+from models.classifier.inference_multitask import extract_state_dict
 from models.classifier.model import create_model
 from models.classifier.train import get_device, resolve_batch_size, resolve_num_workers
 from models.classifier.train_random_split import RandomSplitConfig
 
 TOP_KS = (1, 2, 3, 5)
+
+
+def resolve_exclude_heads(
+    spec: Optional[str],
+    diseases: Sequence[str],
+) -> frozenset[str]:
+    """EXCLUDE_HEADS — Top-K 경쟁에서 제외할 질환 헤드 (쉼표 구분)."""
+    if not spec or not str(spec).strip():
+        return frozenset()
+    names = [x.strip() for x in str(spec).split(",") if x.strip()]
+    unknown = [n for n in names if n not in diseases]
+    if unknown:
+        raise ValueError(f"알 수 없는 EXCLUDE_HEADS 질환: {unknown}")
+    return frozenset(names)
 
 
 def resolve_disease_weights(
@@ -108,10 +130,14 @@ def _rank_diseases_by_abnormal_prob(
     sample_i: int,
     diseases: Sequence[str],
     disease_weights: Optional[Dict[str, float]] = None,
+    exclude_heads: Optional[frozenset[str]] = None,
 ) -> List[Tuple[str, float]]:
     weights = disease_weights or {}
+    excluded = exclude_heads or frozenset()
     scored = []
     for d in diseases:
+        if d in excluded:
+            continue
         prob = head_abnormal_probability(outputs[d][sample_i])
         w = weights.get(d, 1.0)
         scored.append((d, prob * w))
@@ -135,8 +161,10 @@ def evaluate_multitask_topk(
     diseases: List[str],
     device: str,
     disease_weights: Optional[Dict[str, float]] = None,
+    exclude_heads: Optional[frozenset[str]] = None,
 ) -> Dict[str, object]:
     model.eval()
+    excluded = exclude_heads or frozenset()
 
     hits = {k: 0 for k in TOP_KS}
     total = 0
@@ -175,8 +203,11 @@ def evaluate_multitask_topk(
                 continue
 
             ranked = _rank_diseases_by_abnormal_prob(
-                outputs, i, diseases, disease_weights,
+                outputs, i, diseases, disease_weights, excluded,
             )
+            if not ranked:
+                local_idx += 1
+                continue
             ranked_names = [d for d, _ in ranked]
             pred_top1 = ranked_names[0]
 
@@ -226,6 +257,7 @@ def evaluate_multitask_topk(
 
     return {
         "disease_weights": disease_weights or {},
+        "exclude_heads": sorted(excluded),
         "n_abnormal": total,
         "n_skipped_normal": skipped_normal,
         "topk_accuracy": topk_acc,
@@ -242,8 +274,13 @@ def evaluate_multitask_topk(
 def print_results(report: Dict[str, object], diseases: List[str]) -> None:
     n = report["n_abnormal"]
     weights = report.get("disease_weights") or {}
+    excluded = report.get("exclude_heads") or []
     print(f"\n{'=' * 64}")
     print(f"📊 Top-K accuracy (비정상 n={n:,}, 정상 skip={report['n_skipped_normal']:,})")
+    if excluded:
+        print(f"  EXCLUDE_HEADS (Top-K 경쟁 제외): {excluded}")
+    else:
+        print("  EXCLUDE_HEADS: (미설정)")
     if weights:
         applied = {d: weights[d] for d in diseases if d in weights}
         print(f"  DISEASE_WEIGHTS 적용: {applied}")
@@ -311,15 +348,24 @@ def save_results(
     return out_path
 
 
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(description="멀티태스크 Top-K 평가")
+    p.add_argument("--animal", default=os.environ.get("ANIMAL_TYPE", "dog"), choices=["dog", "cat"])
+    p.add_argument("--device", default=os.environ.get("DEVICE"))
+    p.add_argument("--batch-size", type=int, default=None)
+    p.add_argument("--exclude-heads", default=os.environ.get("EXCLUDE_HEADS", ""))
+    return p.parse_args()
+
+
 def main() -> None:
-    animal_type = os.environ.get("ANIMAL_TYPE", "dog").strip().lower()
-    if animal_type not in ("dog", "cat"):
-        raise ValueError("ANIMAL_TYPE=dog 또는 cat")
+    args = parse_args()
+    animal_type = args.animal.strip().lower()
 
     img_size = int(os.environ.get("IMG_SIZE", str(RandomSplitConfig.IMG_SIZE)))
-    batch_size = resolve_batch_size(int(os.environ.get("BATCH_SIZE", "32")))
+    env_bs = os.environ.get("BATCH_SIZE", "32")
+    batch_size = resolve_batch_size(args.batch_size if args.batch_size is not None else int(env_bs))
     num_workers = resolve_num_workers(int(os.environ.get("NUM_WORKERS", "4")))
-    device = get_device()
+    device = args.device or get_device()
 
     print("=" * 64)
     print(f"🔬 멀티태스크 Top-K 평가 ({animal_type.upper()})")
@@ -340,10 +386,13 @@ def main() -> None:
 
     model = create_model(animal_type, pretrained=False)
     ckpt = torch.load(checkpoint, map_location=device, weights_only=False)
-    model.load_state_dict(ckpt["model_state_dict"])
+    model.load_state_dict(extract_state_dict(ckpt))
     model = model.to(device)
     model.eval()
     diseases = model.get_disease_names()
+    exclude_heads = resolve_exclude_heads(args.exclude_heads, diseases)
+    if exclude_heads:
+        print(f"  EXCLUDE_HEADS={sorted(exclude_heads)}")
     print(f"  질환 헤드: {len(diseases)}개")
 
     _, val_loader, _, val_ds, split_meta = create_random_split_dataloaders(
@@ -356,7 +405,7 @@ def main() -> None:
     )
 
     report = evaluate_multitask_topk(
-        model, val_ds, val_loader, diseases, device, disease_weights,
+        model, val_ds, val_loader, diseases, device, disease_weights, exclude_heads,
     )
     print_results(report, diseases)
 
