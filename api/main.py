@@ -159,6 +159,23 @@ class PDFRequest(BaseModel):
     report: PDFReportData
 
 
+class OpinionPDFRequest(BaseModel):
+    """수의사 소견서 PDF 생성 요청 모델"""
+    pet_name: str
+    pet_species: str          # "dog" | "cat"
+    pet_age: Optional[int] = None
+    pet_breed: Optional[str] = None
+    vet_name: Optional[str] = None
+    hospital_name: Optional[str] = None
+    opinion_content: str
+    recommendation: Optional[str] = None
+    visit_required: bool = False
+    answered_at: Optional[str] = None
+    main_disease: Optional[str] = None
+    main_confidence: Optional[float] = None
+    is_normal: bool = False
+
+
 def get_device():
     """최적 디바이스 선택"""
     if torch.backends.mps.is_available():
@@ -572,6 +589,209 @@ def generate_pdf(request: PDFRequest) -> str:
     return pdf_path
 
 
+def generate_opinion_pdf(request: OpinionPDFRequest) -> str:
+    """수의사 소견서 PDF 생성"""
+    global korean_font_name
+
+    if korean_font_name is None:
+        raise ValueError(
+            "한글 폰트가 설정되지 않았습니다. "
+            "서버를 재시작하거나 한글 폰트를 설치하세요."
+        )
+
+    font_name = korean_font_name
+
+    temp_file = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    pdf_path = temp_file.name
+    temp_file.close()
+
+    doc = SimpleDocTemplate(
+        pdf_path,
+        pagesize=A4,
+        topMargin=25 * mm,
+        bottomMargin=25 * mm,
+        leftMargin=25 * mm,
+        rightMargin=25 * mm,
+    )
+
+    story = []
+
+    from reportlab.platypus import HRFlowable, Paragraph as P
+
+    title_style = ParagraphStyle(
+        "OpinionTitle",
+        fontName=font_name,
+        fontSize=22,
+        textColor=colors.HexColor("#1a3a5c"),
+        spaceAfter=6,
+        alignment=TA_CENTER,
+        leading=28,
+    )
+    subtitle_style = ParagraphStyle(
+        "OpinionSubtitle",
+        fontName=font_name,
+        fontSize=10,
+        textColor=colors.HexColor("#555555"),
+        spaceAfter=4,
+        alignment=TA_CENTER,
+    )
+    heading_style = ParagraphStyle(
+        "OpinionHeading",
+        fontName=font_name,
+        fontSize=13,
+        textColor=colors.HexColor("#1a3a5c"),
+        spaceAfter=6,
+        spaceBefore=10,
+        leading=18,
+    )
+    normal_style = ParagraphStyle(
+        "OpinionNormal",
+        fontName=font_name,
+        fontSize=10,
+        textColor=colors.HexColor("#2C3E50"),
+        spaceAfter=5,
+        leading=16,
+    )
+    content_style = ParagraphStyle(
+        "OpinionContent",
+        fontName=font_name,
+        fontSize=10,
+        textColor=colors.HexColor("#2C3E50"),
+        leading=18,
+        spaceAfter=8,
+        leftIndent=5,
+        rightIndent=5,
+    )
+    label_style = ParagraphStyle(
+        "OpinionLabel",
+        fontName=font_name,
+        fontSize=10,
+        textColor=colors.HexColor("#1a3a5c"),
+        leading=14,
+    )
+    cell_style = ParagraphStyle(
+        "OpinionCell",
+        fontName=font_name,
+        fontSize=10,
+        textColor=colors.HexColor("#2C3E50"),
+        leading=14,
+    )
+    disclaimer_style = ParagraphStyle(
+        "OpinionDisclaimer",
+        fontName=font_name,
+        fontSize=8,
+        textColor=colors.HexColor("#95A5A6"),
+        alignment=TA_CENTER,
+        leading=12,
+    )
+
+    # 제목
+    story.append(P("수의사 소견서", title_style))
+    story.append(P("Veterinary Opinion Report", subtitle_style))
+    story.append(Spacer(1, 5 * mm))
+
+    hospital = request.hospital_name or "병원명 미기재"
+    vet = request.vet_name or "수의사명 미기재"
+    issue_date = request.answered_at or datetime.now().strftime("%Y년 %m월 %d일")
+    story.append(P(
+        f"발행일: {issue_date}  |  발행 병원: {hospital}  |  담당 수의사: {vet}",
+        subtitle_style,
+    ))
+    story.append(Spacer(1, 8 * mm))
+
+    story.append(HRFlowable(width="100%", thickness=1.5, color=colors.HexColor("#1a3a5c")))
+    story.append(Spacer(1, 6 * mm))
+
+    # 반려동물 정보
+    story.append(P("반려동물 정보", heading_style))
+    species_label = (
+        "강아지" if request.pet_species == "dog"
+        else "고양이" if request.pet_species == "cat"
+        else request.pet_species
+    )
+    pet_rows = [["이름", request.pet_name], ["종류", species_label]]
+    if request.pet_breed:
+        pet_rows.append(["품종", request.pet_breed])
+    if request.pet_age is not None:
+        pet_rows.append(["나이", f"{request.pet_age}세"])
+
+    pet_table_data = [
+        [P(f"<b>{r[0]}</b>", label_style), P(r[1], cell_style)]
+        for r in pet_rows
+    ]
+    pet_table = Table(pet_table_data, colWidths=[35 * mm, 130 * mm])
+    pet_table.setStyle(TableStyle([
+        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#EBF5FB")),
+        ("GRID", (0, 0), (-1, -1), 0.5, colors.HexColor("#BDC3C7")),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
+        ("LEFTPADDING", (0, 0), (-1, -1), 8),
+    ]))
+    story.append(pet_table)
+    story.append(Spacer(1, 8 * mm))
+
+    # AI 검사 결과 요약
+    story.append(P("AI 검사 결과 요약", heading_style))
+    if request.is_normal:
+        ai_text = "정상 (이상 소견 없음)"
+        ai_color = "#27AE60"
+    else:
+        disease = request.main_disease or "미상"
+        conf_str = f" ({request.main_confidence:.1f}%)" if request.main_confidence is not None else ""
+        ai_text = f"주요 소견: {disease}{conf_str}"
+        ai_color = "#E74C3C"
+    story.append(P(f"<font color='{ai_color}'><b>{ai_text}</b></font>", normal_style))
+    story.append(Spacer(1, 8 * mm))
+
+    # 수의사 소견
+    story.append(P("수의사 소견", heading_style))
+    story.append(HRFlowable(width="100%", thickness=0.5, color=colors.HexColor("#BDC3C7")))
+    story.append(Spacer(1, 4 * mm))
+    story.append(P(request.opinion_content.replace("\n", "<br/>"), content_style))
+    story.append(Spacer(1, 6 * mm))
+
+    # 추가 권장사항
+    if request.recommendation:
+        story.append(P("추가 권장사항", heading_style))
+        story.append(P(request.recommendation.replace("\n", "<br/>"), content_style))
+        story.append(Spacer(1, 6 * mm))
+
+    # 내원 권장
+    story.append(P("내원 권장", heading_style))
+    visit_text = (
+        "즉시 내원을 권장합니다."
+        if request.visit_required
+        else "현재 즉각적인 내원이 필요하지 않으나, 정기 검진을 권장합니다."
+    )
+    visit_color = "#E74C3C" if request.visit_required else "#27AE60"
+    story.append(P(f"<font color='{visit_color}'><b>{visit_text}</b></font>", normal_style))
+    story.append(Spacer(1, 12 * mm))
+
+    # 서명란
+    story.append(HRFlowable(width="100%", thickness=1, color=colors.HexColor("#BDC3C7")))
+    story.append(Spacer(1, 6 * mm))
+    sig_data = [
+        [P(f"담당 수의사: {vet}", cell_style), P(f"병원명: {hospital}", cell_style)],
+        [P("(서명)", disclaimer_style), P("", disclaimer_style)],
+    ]
+    sig_table = Table(sig_data, colWidths=[82 * mm, 82 * mm])
+    sig_table.setStyle(TableStyle([
+        ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ("TOPPADDING", (0, 0), (-1, -1), 4),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
+    ]))
+    story.append(sig_table)
+    story.append(Spacer(1, 8 * mm))
+
+    story.append(P(
+        "본 소견서는 AI 스크리닝 결과를 참고한 수의사의 의견으로, 공식 의료 진단서를 대체하지 않습니다.",
+        disclaimer_style,
+    ))
+
+    doc.build(story)
+    return pdf_path
+
+
 @app.on_event("startup")
 async def startup_event():
     """서버 시작 시 모델 warm-up 및 폰트 설정"""
@@ -889,6 +1109,45 @@ async def generate_pdf_report(request: PDFRequest):
         raise HTTPException(
             status_code=500,
             detail=f"PDF 생성 실패: {str(e)}"
+        )
+
+
+@app.post("/api/ai/opinion-pdf", tags=["AI"])
+async def generate_opinion_pdf_report(request: OpinionPDFRequest):
+    """
+    수의사 소견서 PDF 생성
+
+    Args:
+        request: 소견서 생성 요청 (pet_name, vet_name, opinion_content 등)
+
+    Returns:
+        FileResponse: 소견서 PDF 파일
+    """
+    try:
+        logger.info(f"소견서 PDF 생성 중: {request.pet_name} / 수의사: {request.vet_name}")
+
+        pdf_path = generate_opinion_pdf(request)
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"소견서_{request.pet_name}_{timestamp}.pdf"
+        filename_encoded = quote(filename.encode("utf-8"))
+
+        logger.info(f"소견서 PDF 생성 완료: {filename}")
+
+        return FileResponse(
+            path=pdf_path,
+            media_type="application/pdf",
+            filename=filename,
+            headers={
+                "Content-Disposition": f"attachment; filename*=UTF-8''{filename_encoded}"
+            },
+        )
+
+    except Exception as e:
+        logger.error(f"소견서 PDF 생성 실패: {e}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"소견서 PDF 생성 실패: {str(e)}",
         )
 
 
